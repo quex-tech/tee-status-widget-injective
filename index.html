@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TEE status example</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; padding: 1.5rem; }
+  .widgets { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+  section { flex: 1 1 22rem; max-width: 26rem; }
+  h2 { font-size: 0.85rem; margin: 0 0 0.5rem; }
+  h2 code { font-weight: normal; opacity: 0.7; }
+  .card {
+    border: 1px solid #8884;
+    border-radius: 8px;
+    padding: 0.7rem 0.85rem;
+    margin-top: 0.5rem;
+  }
+  .card-head b { font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.7; }
+  .addr {
+    margin: 0.35rem 0 0.5rem;
+    font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+  }
+  .line { display: flex; align-items: baseline; gap: 0.45rem; font-size: 0.82rem; }
+  .line + .line { margin-top: 0.2rem; }
+  .dim { opacity: 0.65; }
+  hr { border: 0; border-top: 1px solid #8884; margin: 0.6rem 0; }
+  .dot {
+    flex: none;
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: #8b949e;
+  }
+  .dot.ok { background: #2ea043; }
+  .dot.bad { background: #e5534b; }
+  .note { font-size: 0.78rem; opacity: 0.7; min-height: 1.4em; margin: 0.3rem 0 0; }
+  .note.error { color: #e5534b; opacity: 1; }
+  input { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+
+<div class="widgets">
+
+  <!-- Widget 1: REST only. One request per refresh, refreshed by hand. -->
+  <section>
+    <h2>REST <code>fetchAttestation()</code></h2>
+    <form id="rest-form">
+      <input id="rest-node" value="http://localhost:10367" size="26" spellcheck="false" aria-label="Node LCD endpoint">
+      <button type="submit">Fetch</button>
+    </form>
+
+    <div class="card" id="rest-card">
+      <div class="card-head"><b>Enterprise validator</b></div>
+      <div class="addr" data-field="validator">—</div>
+      <div class="line"><span class="dot" data-dot="active"></span><span data-field="active">—</span></div>
+      <div class="line"><span class="dot" data-dot="jail"></span><span data-field="jail">—</span></div>
+      <div class="line dim"><span data-field="attested">—</span></div>
+      <hr>
+      <div class="line"><span class="dot" data-dot="binding"></span><span data-field="binding">—</span></div>
+      <div class="line"><span class="dot" data-dot="debug"></span><span data-field="debug">—</span></div>
+      <div class="line"><span class="dot" data-dot="hash"></span><span data-field="hash">—</span></div>
+      <div class="line"><span class="dot" data-dot="pins"></span><span data-field="pins">—</span></div>
+      <div class="line dim">signature chain not verified here</div>
+    </div>
+    <p class="note" id="rest-note"></p>
+  </section>
+
+  <!-- Widget 2: websocket only. Subscribes to blocks and queries over the
+       same socket, so it needs nothing cross-origin from the node. -->
+  <section>
+    <h2>Websocket <code>fetchAttestationOverRPC()</code></h2>
+    <form id="ws-form">
+      <input id="ws-node" value="ws://localhost:26687/websocket" size="26" spellcheck="false" aria-label="Node RPC websocket">
+      <button type="submit">Reconnect</button>
+    </form>
+
+    <div class="card" id="ws-card">
+      <div class="card-head"><b>Enterprise validator</b></div>
+      <div class="addr" data-field="validator">—</div>
+      <div class="line"><span class="dot" data-dot="active"></span><span data-field="active">—</span></div>
+      <div class="line"><span class="dot" data-dot="jail"></span><span data-field="jail">—</span></div>
+      <div class="line dim"><span data-field="attested">—</span></div>
+      <hr>
+      <div class="line"><span class="dot" data-dot="binding"></span><span data-field="binding">—</span></div>
+      <div class="line"><span class="dot" data-dot="debug"></span><span data-field="debug">—</span></div>
+      <div class="line"><span class="dot" data-dot="hash"></span><span data-field="hash">—</span></div>
+      <div class="line"><span class="dot" data-dot="pins"></span><span data-field="pins">—</span></div>
+      <div class="line dim">signature chain not verified here</div>
+    </div>
+    <p class="note" id="ws-note"></p>
+  </section>
+
+</div>
+
+<script src="attestation.js"></script>
+<script>
+// The pins are the same for both widgets and never change while the page is
+// open, so this is fetched once and awaited wherever it is needed.
+const expected = loadExpectedMeasurements();
+
+// ── widget 1: REST ──────────────────────────────────────────────────────────
+const restCard = document.getElementById("rest-card");
+const restNode = document.getElementById("rest-node");
+const restNote = document.getElementById("rest-note");
+
+document.getElementById("rest-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  loadREST();
+});
+
+async function loadREST() {
+  note(restNote, "fetching…", false);
+  try {
+    const attestation = await fetchAttestation(restNode.value.trim());
+    render(restCard, attestation, await checkQuote(attestation, await expected));
+    note(restNote, "fetched over REST", false);
+  } catch (err) {
+    note(restNote, err.message, true);
+  }
+}
+
+loadREST();
+
+// ── widget 2: websocket ─────────────────────────────────────────────────────
+const wsCard = document.getElementById("ws-card");
+const wsNode = document.getElementById("ws-node");
+const wsNote = document.getElementById("ws-note");
+
+// Declared before follow() runs: a `let` read from a function that runs first
+// throws rather than reading as undefined.
+let socket = null;
+let reconnectTimer = null;
+let busy = false;
+
+document.getElementById("ws-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  follow();
+});
+
+// Subscribes to CometBFT's NewBlock events and re-queries on each one, over
+// the one socket. Websockets are exempt from CORS and CometBFT accepts any
+// origin, so this asks nothing of the node beyond a reachable RPC port.
+function follow() {
+  clearTimeout(reconnectTimer);
+  if (socket) {
+    // Drop the handler first: a socket closed on purpose must not queue a
+    // reconnect that would race the one being opened right here.
+    socket.onclose = null;
+    socket.close();
+  }
+
+  socket = new WebSocket(wsNode.value.trim());
+  socket.onopen = () => {
+    note(wsNote, "following new blocks", false);
+    socket.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "subscribe",
+      params: { query: "tm.event='NewBlock'" },
+    }));
+    loadWS();
+  };
+  socket.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    // Block events carry data; the subscribe ack and this widget's own query
+    // replies do not, and are left to whoever asked for them.
+    const block = msg.result && msg.result.data && msg.result.data.value.block;
+    if (block) loadWS(block.header.height);
+  };
+  socket.onclose = () => {
+    note(wsNote, "disconnected — reconnecting…", true);
+    reconnectTimer = setTimeout(follow, 3000);
+  };
+  socket.onerror = () => note(wsNote, "websocket error — check the RPC address", true);
+}
+
+async function loadWS(height) {
+  if (busy) return; // a block landed while the last query was still running
+  busy = true;
+  try {
+    const attestation = await fetchAttestationOverRPC(socket);
+    render(wsCard, attestation, await checkQuote(attestation, await expected));
+    note(wsNote, height ? "block " + height : "connected", false);
+  } catch (err) {
+    note(wsNote, err.message, true);
+  } finally {
+    busy = false;
+  }
+}
+
+follow();
+
+// ── rendering: identical for both, and free of any decision of its own ──────
+function render(card, a, checks) {
+  field(card, "validator", a.validator || "no EV candidate set");
+
+  dot(card, "active", a.isActive);
+  field(card, "active", a.isActive === null ? "unknown" : a.isActive ? "active" : "inactive");
+
+  // The jail dot reads as health, not as jailing: green means "not jailed".
+  dot(card, "jail", a.softJailed === null ? null : !a.softJailed);
+  field(card, "jail", jailText(a));
+  field(card, "attested", attestedText(a));
+
+  for (const name of Object.keys(checks)) {
+    dot(card, name, checks[name].ok);
+    field(card, name, checks[name].text);
+  }
+}
+
+function jailText(a) {
+  if (a.softJailed === null) return "jail status unknown";
+  const escalations = a.jailEscalationCount ? ` · ${a.jailEscalationCount} escalations` : "";
+  if (a.softJailed) return `soft-jailed until ${a.softJailUntilHeight}${escalations}`;
+  const missed = a.missStreak ? ` · ${a.missStreak} missed` : "";
+  return `not jailed${missed}${escalations}`;
+}
+
+function attestedText(a) {
+  if (a.attestationHeight === null) return a.validator ? "no attestation registered" : "—";
+  return `attested at height ${a.attestationHeight} · ${a.isDcap ? "DCAP quote" : "bare TDREPORT"}`;
+}
+
+function field(card, name, value) {
+  card.querySelector(`[data-field="${name}"]`).textContent = value;
+}
+
+// Tristate: true green, false red, null grey.
+function dot(card, name, state) {
+  card.querySelector(`[data-dot="${name}"]`).className =
+    "dot" + (state === null ? "" : state ? " ok" : " bad");
+}
+
+function note(el, msg, isError) {
+  el.textContent = msg;
+  el.className = isError ? "note error" : "note";
+}
+</script>
+
+</body>
+</html>

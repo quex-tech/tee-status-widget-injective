@@ -1,0 +1,9 @@
+{
+  "source": "who published these values and for which build — shown on the card, so a viewer can tell what it is pinned against",
+
+  "mrtd": "96 hex characters: the TDX virtual firmware the TD booted",
+  "rtmr0": "96 hex characters: platform config. Drifts on a cloud firmware rotation without anything being wrong — leave it out unless you are ready to update the file when that happens",
+  "rtmr1": "96 hex characters: the boot chain, and the one that pins the actual code. Valid for exactly one build, so every redeploy needs a new file",
+
+  "_usage": "Rename to expected-measurements.json and serve it next to index.html. Any key you omit is simply not checked. Get these values from whoever builds the image — never from the node the widget queries, whose own account of what it runs proves nothing."
+}
