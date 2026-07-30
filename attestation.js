@@ -1,5 +1,6 @@
-// attestation.js — read an Injective chain's enterprise-validator TEE
-// attestation from a browser, and check what a browser is able to check.
+// attestation.js — read an Injective chain's enterprise validators and the
+// TEE quotes they announced, from a browser, and check what a browser is
+// able to check.
 //
 // A plain script: no build step, no dependencies, no DOM. Drop it next to
 // your page and load it before your own script.
@@ -9,59 +10,78 @@
 //
 // ── WHAT TO CALL ────────────────────────────────────────────────────────────
 //
-//   fetchAttestation(lcdURL)
-//     The easy one. Reads the attestation from a node's REST (LCD) endpoint,
-//     e.g. "http://a.node:1317". Requires that node to allow cross-origin
-//     reads (enabled-unsafe-cors in its app.toml); many public endpoints do,
-//     and there is nothing else to set up.
+//   fetchTEEStatus(socketOrURL, expected, height)
+//     The whole thing in one call: reads the enterprise-validator set over
+//     CometBFT's RPC websocket, e.g. "ws://a.node:26657/websocket", fetches
+//     each one's quote and the module's params, and hands back the lamps
+//     already decided. Websockets are exempt from CORS, so no node has to opt
+//     in to being read by a browser. Pass a socket you already have open — a
+//     NewBlock subscription, say — and it shares it without disturbing your
+//     own message handler.
 //
-//   fetchAttestationOverRPC(socketOrURL, height)
-//     The same answer over CometBFT's RPC websocket, e.g.
-//     "ws://a.node:26657/websocket". Prefer it when you can: websockets are
-//     exempt from CORS, so no node has to opt in to being read by a browser,
-//     and it can query a past block by height, which the REST route cannot.
-//     Pass a socket you already have open — a NewBlock subscription, say —
-//     and it shares it without disturbing your own message handler.
+//     Both `expected` and `height` are optional. Without pins, the pins lamp
+//     goes grey rather than passing; without a height, the query is answered
+//     at the last committed block. Nothing here fails for want of either —
+//     what cannot be checked is reported as grey, never as fine.
 //
-//   checkQuote(attestation, expected)
-//     Takes what either of those returned and reports four checks, ready to
-//     render. `expected` is optional.
+//     There is no REST route. The quote is not exposed by any query RPC, and
+//     the raw store read that reaches it is an ABCI query, which the LCD does
+//     not proxy — see WHERE THE QUOTE COMES FROM below.
 //
 //   loadExpectedMeasurements(url)
-//     Convenience for checkQuote's second argument: fetches
+//     Convenience for the `expected` argument: fetches
 //     ./expected-measurements.json from your own server.
 //
 //
 // ── WHAT YOU GET BACK ───────────────────────────────────────────────────────
 //
-// Both fetch functions resolve to the same object. Every field is either a
-// value or null — an explicit "none", never a missing key — so you can render
-// it field by field without testing for shape:
+//   height       number   the block the answers were read at
+//   validators   array    one entry per enterprise validator the chain
+//                         recognises, in its order; empty if it knows none
 //
-//   validator             string | null   EV candidate valoper address
-//   isActive              bool   | null   S_EV currently active
-//   softJailed            bool   | null   EV soft-jailed right now
-//   softJailUntilHeight   number | null   height the jail lifts at, while jailed
-//   missStreak            number | null   consecutive missed EV slots
-//   jailEscalationCount   number | null   consecutive soft-jail episodes
-//   isDcap                bool   | null   a full DCAP quote, not a bare TDREPORT
-//   quote                 string | null   the quote itself, base64 as stored on-chain
-//   quoteHash             string | null   sha256(quote), hex
-//   teePubkey             string | null   ed25519 key generated inside the TD, hex
-//   attestationHeight     number | null   height the attestation was last submitted at
+// Every field of an entry is either a value or null — an explicit "none",
+// never a missing key:
 //
-// They throw only when the query itself failed — node unreachable, or an
+//   valoper     string | null   operator address; null when the chain could
+//                               not resolve one from the consensus address
+//   consAddr    string | null   consensus address, hex — the form CometBFT
+//                               reports a block proposer in
+//   teePubkey   string | null   ed25519 key generated inside the TD, hex
+//   quote       string | null   the quote itself, base64 as stored on-chain
+//   checks      object          the four lamps, below
+//
+// It throws only when the query itself failed — node unreachable, or an
 // answer that was not a query result. That is worth showing as an error; an
 // absent value is not, and comes back as null instead.
 //
-// checkQuote resolves to four results, each { ok, text }, where ok is true,
-// false, or null for "could not tell" — never null for "fine". Put text next
-// to a green / red / grey light and you are done:
+// `checks` holds four results, each { ok, text }, where ok is true, false, or
+// null for "could not tell" — never null for "fine". Each is named for the
+// good state, so a green lamp always means the thing the name says. Put text
+// next to a green / red / grey light and you are done:
 //
+//   live      the EV is not soft-jailed and is keeping up
 //   binding   the registered key was generated inside this TD
-//   debug     the TD is not host-debuggable
-//   hash      the quote matches the quote_hash that vouches are counted against
+//   sealed    the TD's memory is closed to the host it runs on
 //   pins      the measurements match the ones you pinned
+//
+// The chain keeps one set of liveness counters, not one per validator, and
+// they belong to the first entry; any entry after it gets a grey `live`. The
+// counters also only move while the module's ev_hijack_enabled is on, so with
+// governance holding that switch off, `live` is grey rather than green: an EV
+// that is never given a slot cannot be said to be keeping up.
+//
+//
+// ── WHERE THE QUOTE COMES FROM ──────────────────────────────────────────────
+//
+// x/tee stores the announced quote but exposes no query that reads it back
+// out, so this reads the module's store directly: an ABCI query against
+// /store/tee/key at the key the module writes under, 0x02 followed by the
+// validator's 20 address bytes.
+//
+// That key layout is internal to the module. It is not part of the proto API
+// and nothing promises to keep it, so a chain that reorganises its store will
+// need QUOTE_KEY_PREFIX below changed to match. It is, today, the only route
+// from a browser to a quote.
 //
 //
 // ── WHAT THIS DOES NOT TELL YOU ─────────────────────────────────────────────
@@ -75,54 +95,48 @@
 //
 // ── EXAMPLE ─────────────────────────────────────────────────────────────────
 //
-//   const a = await fetchAttestation("http://localhost:1317");
-//   const checks = await checkQuote(a, await loadExpectedMeasurements());
+//   const expected = await loadExpectedMeasurements();
+//   const status = await fetchTEEStatus("ws://localhost:26657/websocket", expected);
 //
-//   console.log(a.validator, a.isActive);              // who, and is it live
-//   console.log(checks.binding.ok, checks.binding.text);
+//   console.log("as of block", status.height);
+//   for (const v of status.validators) {
+//     console.log(v.valoper);
+//     for (const [lamp, { ok, text }] of Object.entries(v.checks)) {
+//       console.log(" ", lamp, ok, text);
+//     }
+//   }
 //
 // ════════════════════════════════════════════════════════════════════════════
-// THE FOUR ENTRY POINTS
+// THE TWO ENTRY POINTS
 // ════════════════════════════════════════════════════════════════════════════
-
-async function fetchAttestation(base) {
-  const ev = await getJSON(base + "/injective/tee/v1/ev_status");
-  const validator = ev.candidate || null;
-
-  return build(ev, validator ? await getAttestation(base, validator) : {});
-}
 
 // Sharing a socket is safe: this listens with addEventListener and matches on
 // the JSON-RPC id, leaving the page's own socket.onmessage to fire alongside
 // it untouched. Give it a ws:// string instead and it opens and closes a
-// socket of its own around the two queries.
-async function fetchAttestationOverRPC(socketOrURL, height) {
+// socket of its own around the queries.
+async function fetchTEEStatus(socketOrURL, expected, height) {
   const rpc = await openRPC(socketOrURL);
   try {
-    const ev = decodeEVStatus(await rpc.query(EV_STATUS_PATH, "", height));
-    const validator = ev.candidate || null;
+    const answer = await rpc.query(EV_STATUS_PATH, "", height);
+    const status = decodeEVStatus(answer.bytes);
+    // The params say what the liveness counters are measured against, and
+    // whether they are being kept at all — without them a miss streak is a
+    // number with nothing to compare it to.
+    const params = decodeParams((await rpc.query(PARAMS_PATH, "", height)).bytes);
 
-    // A candidate with no attestation answers with a non-zero code, the
-    // equivalent of the REST gateway's 404: absent, not broken.
-    const raw = validator
-      ? await rpc.query(ATTESTATION_PATH, encodeStringField(1, validator), height, true)
-      : null;
-    return build(ev, raw ? decodeAttestation(raw) : {});
+    // One quote query per validator, in turn. They share the one socket, and
+    // an EV set numbers a handful at most, so there is nothing here worth the
+    // machinery of issuing them together.
+    const validators = [];
+    for (const ev of status.enterprise_validators) {
+      const quote = ev.valoper ? await fetchQuote(rpc, ev.valoper, height) : null;
+      validators.push(build(ev, quote, status, params, expected, validators.length === 0));
+    }
+
+    return { height: answer.height, validators: validators };
   } finally {
     rpc.close();
   }
-}
-
-async function checkQuote(attestation, expected) {
-  const quote = attestation.quote ? base64ToBytes(attestation.quote) : null;
-  const body = quote ? quoteBody(quote) : null;
-
-  return {
-    binding: bindingCheck(attestation, body),
-    debug: debugCheck(body),
-    hash: await hashCheck(attestation, quote),
-    pins: pinsCheck(body, expected),
-  };
 }
 
 // Same origin, so no CORS and no node involved. A missing file is a normal
@@ -148,101 +162,52 @@ async function loadExpectedMeasurements(url) {
 
 // ── the returned shape ──────────────────────────────────────────────────────
 
-// build turns the two raw chain messages into the returned object. Both
-// transports feed it the same snake_case shape — the REST gateway produces it
-// directly, and the protobuf decoder is written to match — so the field list,
-// and the rules about what counts as none, live here once.
-function build(ev, attestation) {
-  const validator = ev.candidate || null;
-
-  // With no candidate there is no EV to be active, jailed or attested. Leaving
-  // the rest as none beats reporting the zeroes the chain happens to store.
-  const status = validator ? ev : {};
-  const att = validator ? attestation : {};
-
-  const softJailed = boolOrNull(status.soft_jailed);
-  return {
-    validator,
-    isActive: boolOrNull(status.is_active),
-    softJailed,
-    // The stored height outlives the jail it belongs to, so it is only an
-    // answer to "until when?" while the jail is actually on.
-    softJailUntilHeight: softJailed ? numberOrNull(status.soft_jail_until_height) : null,
-    missStreak: numberOrNull(status.miss_streak),
-    jailEscalationCount: numberOrNull(status.jail_escalation_count),
-    isDcap: boolOrNull(att.is_dcap),
-    quote: valueOrNull(att.quote),
-    quoteHash: hexOrNull(att.quote_hash),
-    teePubkey: hexOrNull(att.tee_pubkey),
-    attestationHeight: numberOrNull(att.height),
+// build turns one decoded validator and its quote into an entry of the
+// returned array, lamps and all, so the rules about what counts as none live
+// here once.
+function build(ev, quote, status, params, expected, first) {
+  const body = quoteBody(decodeQuote(quote));
+  const validator = {
+    valoper: ev.valoper || null,
+    consAddr: ev.cons_addr ? toHex(ev.cons_addr) : null,
+    teePubkey: ev.tee_pubkey ? toHex(ev.tee_pubkey) : null,
+    quote: quote,
   };
-}
 
-// null, not undefined and not "": undefined reads as "nobody filled this in",
-// null as "asked the chain, it has nothing" — and null is what JSON carries.
-function valueOrNull(v) {
-  return v === undefined || v === null || v === "" ? null : v;
-}
-
-function boolOrNull(v) {
-  return typeof v === "boolean" ? v : null;
-}
-
-// The chain reports its 64-bit integers as JSON strings, to protect a
-// precision that block heights and small counters never come near — they stay
-// many orders of magnitude below Number.MAX_SAFE_INTEGER — so they are handed
-// over as numbers, ready to compare and format. Anything unparseable becomes
-// none rather than NaN, which no widget should ever have to render.
-function numberOrNull(v) {
-  const n = Number(valueOrNull(v));
-  return Number.isFinite(n) ? n : null;
-}
-
-// Proto bytes fields cross the REST gateway base64-encoded, and arrive as
-// JSON null when empty.
-function hexOrNull(b64) {
-  if (!b64) return null;
-  return Array.from(atob(b64), (c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
-}
-
-// ── transport: REST ─────────────────────────────────────────────────────────
-
-// A candidate that has never registered an attestation is a 404 from the
-// gateway: an absent value, not a failure. Only this second query tolerates
-// one, so a base URL that isn't an LCD at all still fails loudly on the first.
-async function getAttestation(base, validator) {
-  const resp = await getJSON(base + "/injective/tee/v1/attestations/" + validator, true);
-  return (resp && resp.attestation) || {};
-}
-
-async function getJSON(url, nullOn404) {
-  let resp;
-  try {
-    resp = await fetch(url);
-  } catch (err) {
-    // fetch() reports a CORS refusal and an unreachable host identically, as
-    // a bare TypeError, so both have to be named here.
-    throw new Error(
-      url + ": " + err.message +
-      " — node unreachable, or its API server has enabled-unsafe-cors = false in app.toml"
-    );
-  }
-  if (resp.status === 404 && nullOn404) return null;
-  if (!resp.ok) {
-    // grpc-gateway returns errors as {code, message, details}.
-    const body = await resp.json().catch(() => null);
-    throw new Error(body && body.message ? body.message : "HTTP " + resp.status + " " + resp.statusText);
-  }
-  return resp.json();
+  validator.checks = {
+    live: liveCheck(status, params, first),
+    binding: bindingCheck(validator, body),
+    sealed: sealedCheck(body),
+    pins: pinsCheck(body, expected),
+  };
+  return validator;
 }
 
 // ── transport: CometBFT RPC websocket ───────────────────────────────────────
 
 const EV_STATUS_PATH = "/injective.tee.v1.Query/EVStatus";
-const ATTESTATION_PATH = "/injective.tee.v1.Query/Attestation";
+const PARAMS_PATH = "/injective.tee.v1.Query/Params";
+const STORE_PATH = "/store/tee/key";
+
+// x/tee's EnterpriseValidatorQuoteKey — see WHERE THE QUOTE COMES FROM.
+const QUOTE_KEY_PREFIX = "02";
+
 const RPC_TIMEOUT_MS = 10000;
 
 let nextRPCID = 1000; // clear of the ids a page uses for its own subscriptions
+
+// A validator that is whitelisted but has not announced a quote yet is a key
+// the store simply does not hold: an empty value under a successful query,
+// which is an absent quote and not a failure.
+async function fetchQuote(rpc, valoper, height) {
+  const key = QUOTE_KEY_PREFIX + toHex(bech32Data(valoper));
+  const answer = await rpc.query(STORE_PATH, key, height);
+
+  // The module stores the base64 text the announcing message carried, not the
+  // bytes it decodes to, so what comes back out of the store is already the
+  // form the rest of this file expects.
+  return answer.bytes.length ? utf8(answer.bytes) : null;
+}
 
 function openRPC(socketOrURL) {
   if (typeof socketOrURL !== "string") return whenOpen(socketOrURL, false);
@@ -255,7 +220,7 @@ function openRPC(socketOrURL) {
 
 function whenOpen(socket, owned) {
   const client = {
-    query: (path, data, height, allowError) => rpcQuery(socket, path, data, height, allowError),
+    query: (path, data, height) => rpcQuery(socket, path, data, height),
     // Only a socket opened here gets closed here; a borrowed one outlives the
     // query and stays whatever the page made of it.
     close: () => { if (owned) socket.close(); },
@@ -268,7 +233,10 @@ function whenOpen(socket, owned) {
   });
 }
 
-function rpcQuery(socket, path, data, height, allowError) {
+// Resolves { bytes, height }: the height is the block the node actually
+// answered at, which is the honest label for what is on screen — it is the
+// last committed block, not necessarily the one whose arrival triggered this.
+function rpcQuery(socket, path, data, height) {
   const id = nextRPCID++;
   const params = { path: path, data: data, prove: false };
   if (height) params.height = String(height);
@@ -289,10 +257,9 @@ function rpcQuery(socket, path, data, height, allowError) {
 
       const resp = msg.result.response;
       if (resp.code !== 0) {
-        if (allowError) return resolve(null);
         return reject(new Error(path + ": " + (resp.log || "query failed with code " + resp.code)));
       }
-      resolve(base64ToBytes(resp.value));
+      resolve({ bytes: base64ToBytes(resp.value), height: Number(resp.height) });
     }
 
     socket.addEventListener("message", onMessage);
@@ -300,51 +267,113 @@ function rpcQuery(socket, path, data, height, allowError) {
   });
 }
 
+// ── bech32 ──────────────────────────────────────────────────────────────────
+//
+// The store is keyed by a validator's raw address bytes, so the bech32 string
+// the chain hands out has to be taken apart. Only the payload is wanted: the
+// checksum is there to catch a human mistyping an address, and this one
+// arrived from the chain in the same answer as everything else.
+
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const BECH32_CHECKSUM_LENGTH = 6;
+
+function bech32Data(address) {
+  // The human-readable part is allowed to contain a "1" of its own, so the
+  // separator is the last one, not the first.
+  const separator = address.lastIndexOf("1");
+  if (separator < 0) throw new Error(address + ": not a bech32 address");
+
+  const out = [];
+  let acc = 0;
+  let bits = 0;
+
+  for (const c of address.slice(separator + 1, -BECH32_CHECKSUM_LENGTH)) {
+    const value = BECH32_CHARSET.indexOf(c);
+    if (value < 0) throw new Error(address + ": not a bech32 address");
+
+    // Five bits in per character, eight out per byte, oldest bits first.
+    acc = (acc << 5) | value;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((acc >> bits) & 0xff);
+      acc &= (1 << bits) - 1;
+    }
+  }
+
+  if (out.length === 0) throw new Error(address + ": not a bech32 address");
+  return new Uint8Array(out);
+}
+
 // ── protobuf ────────────────────────────────────────────────────────────────
 //
-// Only enough of the wire format to read two messages: varints, length-
-// delimited fields, and enough of the fixed-width ones to step over anything
-// unrecognized. The decoders name fields by number, so they stay correct as
-// long as injective/tee/v1 only ever appends — the compatibility promise
-// protobuf makes anyway.
+// Only enough of the wire format to read one message and the one nested in
+// it: varints, length-delimited fields, and enough of the fixed-width ones to
+// step over anything unrecognized. The decoders name fields by number, so
+// they stay correct as long as injective/tee/v1 only ever appends — the
+// compatibility promise protobuf makes anyway.
 
 function decodeEVStatus(bytes) {
   const f = readFields(bytes);
   return {
-    candidate: utf8(f[1]),
-    is_active: bool(f[2]),
-    bonded_vp_fraction: utf8(f[3]),
+    // 1 to 3 are reserved: the EV candidate, the derived S_EV flag and the
+    // vouching fraction, from the stake-based model the whitelist replaced.
     soft_jailed: bool(f[4]),
     soft_jail_until_height: int(f[5]),
     miss_streak: int(f[6]),
     jail_escalation_count: int(f[7]),
+    enterprise_validators: readRepeated(bytes, 8).map(decodeEnterpriseValidator),
   };
 }
 
-function decodeAttestation(bytes) {
-  // QueryAttestationResponse wraps the Attestation in field 1.
+function decodeParams(bytes) {
+  // QueryParamsResponse wraps Params in field 1.
   const inner = readFields(bytes)[1];
-  if (inner === undefined) return {};
-
-  const f = readFields(inner);
+  const f = inner === undefined ? {} : readFields(inner);
   return {
-    tee_pubkey: bytesToBase64(f[1]),
-    quote: bytesToBase64(f[2]),
-    is_dcap: bool(f[3]),
-    event_log: bytesToBase64(f[4]),
-    quote_hash: bytesToBase64(f[5]),
-    peer_id: utf8(f[6]),
-    height: int(f[7]),
+    // 1 to 3 are reserved: the EV candidate and the vouch thresholds.
+    ev_grace_rounds: int(f[4]),
+    ev_miss_threshold: int(f[5]),
+    ev_soft_jail_base_blocks: int(f[6]),
+    ev_backpressure_growth_blocks: int(f[7]),
+    ev_hijack_enabled: bool(f[8]),
   };
 }
 
-// readFields returns the last value seen per field number: varints as numbers,
-// length-delimited fields as byte slices. A field the message never set is
-// simply missing — protobuf does not put default values on the wire — so the
-// accessors below supply the proto defaults, which is what an absent field
-// means. Absent is never "unknown" here, unlike over REST.
+function decodeEnterpriseValidator(bytes) {
+  const f = readFields(bytes);
+  return {
+    valoper: utf8(f[1]),
+    cons_addr: f[2],
+    tee_pubkey: f[3],
+  };
+}
+
+// readFields returns the last value seen per field number: varints as
+// numbers, length-delimited fields as byte slices. A field the message never
+// set is simply missing — protobuf does not put default values on the wire —
+// so the accessors below supply the proto defaults, which is what an absent
+// field means. Absent is never "unknown" here.
 function readFields(bytes) {
   const fields = {};
+  for (const field of walk(bytes)) fields[field.number] = field.value;
+  return fields;
+}
+
+// Last-seen is what proto3 means by a scalar appearing twice, but a repeated
+// field is the one case where every occurrence counts, so it gets a pass of
+// its own rather than a shape that would complicate every other read.
+function readRepeated(bytes, number) {
+  const out = [];
+  for (const field of walk(bytes)) {
+    if (field.number === number && field.value !== undefined) out.push(field.value);
+  }
+  return out;
+}
+
+// walk yields the message's fields in the order they appear on the wire, so
+// the wire format itself is written out once and read two ways.
+function* walk(bytes) {
   let i = 0;
 
   while (i < bytes.length) {
@@ -355,19 +384,18 @@ function readFields(bytes) {
 
     if (wire === 0) {
       const v = readVarint(bytes, i);
-      fields[number] = v.value;
       i = v.next;
+      yield { number: number, value: v.value };
     } else if (wire === 2) {
       const len = readVarint(bytes, i);
-      fields[number] = bytes.subarray(len.next, len.next + len.value);
       i = len.next + len.value;
+      yield { number: number, value: bytes.subarray(len.next, i) };
     } else if (wire === 5 || wire === 1) {
       i += wire === 5 ? 4 : 8; // fixed32 / fixed64: unused here, stepped over
     } else {
       throw new Error("unsupported protobuf wire type " + wire);
     }
   }
-  return fields;
 }
 
 function readVarint(bytes, i) {
@@ -389,25 +417,7 @@ const utf8 = (b) => (b === undefined ? "" : new TextDecoder().decode(b));
 const bool = (v) => v !== undefined && v !== 0;
 const int = (v) => (v === undefined ? 0 : v);
 
-// The one thing this has to write — a request carrying a single string,
-// hex-encoded the way CometBFT's RPC expects its byte params.
-function encodeStringField(number, value) {
-  const body = new TextEncoder().encode(value);
-  const header = [number * 8 + 2].concat(varintBytes(body.length));
-  return toHex(header) + toHex(body);
-}
-
-function varintBytes(n) {
-  const out = [];
-  while (n > 127) {
-    out.push((n % 128) + 128);
-    n = Math.floor(n / 128);
-  }
-  out.push(n);
-  return out;
-}
-
-// ── the quote, and the four checks ──────────────────────────────────────────
+// ── the quote, and the four lamps ───────────────────────────────────────────
 
 // Byte offsets into a TD Quote v4: a 48-byte header, then the 584-byte body.
 // Fixed by the structure, so a plain slice is all it takes to read them.
@@ -417,8 +427,21 @@ const OFF_MRTD = 184;
 const OFF_RTMR = 376; // four 48-byte registers, back to back
 const OFF_REPORT_DATA = 568;
 
+// The store holds text, so the quote is base64 only by convention: the chain
+// checks that on the way in, nothing checks it on the way out. Unparseable
+// reads as no readable quote, the same as a truncated one, rather than
+// throwing out of the middle of a render.
+function decodeQuote(b64) {
+  if (!b64) return null;
+  try {
+    return base64ToBytes(b64);
+  } catch {
+    return null;
+  }
+}
+
 function quoteBody(quote) {
-  if (quote.length < QUOTE_MIN_LENGTH) return null;
+  if (!quote || quote.length < QUOTE_MIN_LENGTH) return null;
 
   const version = quote[0] + quote[1] * 256;
   const teeType = quote[4] + quote[5] * 256 + quote[6] * 65536 + quote[7] * 16777216;
@@ -435,60 +458,68 @@ function quoteBody(quote) {
   };
 }
 
-// The check that makes fetching both halves from chain state worth something:
-// the key the chain hands out is the key this TD generated, not merely one
-// stored next to a quote.
-function bindingCheck(attestation, body) {
-  if (!body) return unreadable(attestation);
-  if (!attestation.teePubkey) return { ok: null, text: "no registered key to compare against" };
+// The chain keeps one set of these counters, not one per validator, and they
+// only move while the proposer hijack is on: with it off the EV is never
+// handed a slot to miss, so a clean streak would mean nothing at all.
+function liveCheck(status, params, first) {
+  if (!first) return { ok: null, text: "liveness counted for the first EV only" };
+  if (!params.ev_hijack_enabled) return { ok: null, text: "liveness not enforced by this chain" };
 
-  return body.reportDataKey === attestation.teePubkey.toLowerCase()
-    ? { ok: true, text: "TEE key is the one generated inside this TD" }
-    : { ok: false, text: "REPORT_DATA does not match the registered key" };
+  const escalation = status.jail_escalation_count ? ` · escalation ${status.jail_escalation_count}` : "";
+  if (status.soft_jailed) {
+    return { ok: false, text: `soft-jailed until block ${status.soft_jail_until_height}${escalation}` };
+  }
+
+  // A miss streak below the threshold is not yet a fault, so it stays green —
+  // but it is the number worth watching, and it is meaningless without the
+  // threshold it is racing.
+  const missed = status.miss_streak
+    ? ` · missed ${status.miss_streak} of ${params.ev_miss_threshold}`
+    : "";
+  return { ok: true, text: `not jailed${missed}${escalation}` };
 }
 
-function debugCheck(body) {
+// The check that makes reading both halves of the chain's state worth
+// something: the key the chain hands out is the key this TD generated, not
+// merely one stored next to a quote.
+function bindingCheck(validator, body) {
+  if (!body) return unreadable(validator);
+  if (!validator.teePubkey) return { ok: null, text: "no registered key to compare" };
+
+  return body.reportDataKey === validator.teePubkey.toLowerCase()
+    ? { ok: true, text: "key was made inside this TD" }
+    : { ok: false, text: "key is not the one in the quote" };
+}
+
+function sealedCheck(body) {
   if (!body) return { ok: null, text: "debug flag unreadable" };
 
   // Nothing else gives this away: a debug TD booted from the pinned image has
   // identical measurements, and the host can read its memory.
   return body.debug
-    ? { ok: false, text: "TD is host-debuggable — its key must not be trusted" }
-    : { ok: true, text: "TD is not host-debuggable" };
-}
-
-async function hashCheck(attestation, quote) {
-  if (!quote || !attestation.quoteHash) return { ok: null, text: "nothing to hash" };
-  // Vouches name a quote by this hash, so it is what the tally is really about.
-  if (!globalThis.crypto || !crypto.subtle) {
-    return { ok: null, text: "hashing needs a secure context (https, or localhost)" };
-  }
-
-  const digest = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", quote)));
-  return digest === attestation.quoteHash.toLowerCase()
-    ? { ok: true, text: "quote matches the hash vouches are counted against" }
-    : { ok: false, text: "quote does not hash to the stored quote_hash" };
+    ? { ok: false, text: "host can read this TD — key unsafe" }
+    : { ok: true, text: "memory sealed from the host" };
 }
 
 function pinsCheck(body, expected) {
   if (!body) return { ok: null, text: "measurements unreadable" };
-  if (!expected) return { ok: null, text: "not pinned — add expected-measurements.json" };
+  if (!expected) return { ok: null, text: "not pinned" };
 
   const measured = { mrtd: body.mrtd, rtmr0: body.rtmr[0], rtmr1: body.rtmr[1] };
   const compared = Object.keys(measured).filter((k) => expected[k]);
   if (compared.length === 0) return { ok: null, text: "pin file names no measurements" };
 
   const wrong = compared.filter((k) => measured[k] !== String(expected[k]).toLowerCase());
-  const source = expected.source ? " from " + expected.source : "";
+  const source = expected.source ? ` · ${expected.source}` : "";
   return wrong.length === 0
-    ? { ok: true, text: `matches ${compared.join(", ")} pinned${source}` }
-    : { ok: false, text: `${wrong.join(", ")} does not match the pins${source}` };
+    ? { ok: true, text: `matches ${compared.join(", ")}${source}` }
+    : { ok: false, text: `${wrong.join(", ")} differs from pins${source}` };
 }
 
-function unreadable(attestation) {
-  return attestation.quote
+function unreadable(validator) {
+  return validator.quote
     ? { ok: null, text: "not a TD Quote v4" }
-    : { ok: null, text: "no quote registered" };
+    : { ok: null, text: "no quote announced" };
 }
 
 // ── bytes ───────────────────────────────────────────────────────────────────
@@ -502,15 +533,4 @@ function base64ToBytes(b64) {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
-}
-
-// Chunked, because a quote is ~8 kB and String.fromCharCode takes its bytes as
-// arguments — the whole thing at once risks blowing the argument limit.
-function bytesToBase64(bytes) {
-  if (bytes === undefined) return "";
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 4096) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 4096));
-  }
-  return btoa(bin);
 }
