@@ -83,7 +83,9 @@ const wsNote = document.getElementById("ws-note");
 // throws rather than reading as undefined.
 let socket = null;
 let reconnectTimer = null;
-let busy = false;
+// The socket a query is currently running against, so a query can be told
+// apart from one issued before a reconnect rather than merely "some query".
+let inFlight = null;
 
 document.getElementById("ws-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -128,19 +130,27 @@ function follow() {
 }
 
 async function load() {
-  if (busy) return; // a block landed while the last query was still running
-  busy = true;
+  const mine = socket;
+  if (inFlight === mine) return; // a block landed while the last query ran
+  inFlight = mine;
+
   try {
-    const status = await fetchTEEStatus(socket, await expected);
+    const status = await fetchTEEStatus(mine, await expected);
+    if (mine !== socket) return;
     show(status.validators, "no enterprise validator on this chain");
     note("block " + status.height, false);
   } catch (err) {
+    // Typing a new address closes the old socket, which strands any query
+    // running on it until that query's own timeout rejects it — seconds after
+    // the new socket is up and answering. Its failure says nothing about the
+    // node now on screen, so it is dropped rather than painted over one.
+    if (mine !== socket) return;
     // A failed query tells us nothing about the validator, so every lamp goes
     // back to grey. Leaving the last good answer on screen would be a lie.
     show(null, "node did not answer");
     note(err.message, true);
   } finally {
-    busy = false;
+    if (inFlight === mine) inFlight = null;
   }
 }
 
